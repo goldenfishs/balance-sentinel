@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     ports:
-      - "3000:8000"
+      - "127.0.0.1:3000:8000"
     environment:
       DATABASE_PATH: /data/balance-monitor.db
       MONITOR_INTERVAL_SECONDS: ${MONITOR_INTERVAL_SECONDS:-300}
