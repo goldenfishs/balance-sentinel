@@ -274,7 +274,7 @@ def update_account(account_id: str, payload: AccountUpdate) -> dict[str, Any]:
     return account_view(row)
 
 
-@app.delete("/api/accounts/{account_id}", status_code=204)
+@app.delete("/api/accounts/{account_id}", status_code=200)
 def delete_account(account_id: str) -> None:
     with conn() as c:
         c.execute("DELETE FROM accounts WHERE id=?", (account_id,))
@@ -309,6 +309,8 @@ async def check_all() -> dict[str, Any]:
 
 @app.get("/{path:path}")
 def frontend(path: str):
-    file = Path("/app/public") / path
+    public_dir = Path(__file__).resolve().parent / "public"
+    if not public_dir.exists(): public_dir = Path(__file__).resolve().parent.parent / "public"
+    file = public_dir / path
     if path and file.is_file(): return FileResponse(file)
-    return FileResponse(Path("/app/public/index.html"))
+    return FileResponse(public_dir / "index.html")
