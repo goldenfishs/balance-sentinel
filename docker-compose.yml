@@ -9,6 +9,8 @@ services:
       DATABASE_PATH: /data/balance-monitor.db
       MONITOR_INTERVAL_SECONDS: ${MONITOR_INTERVAL_SECONDS:-300}
       CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-now}
     volumes:
       - balance_data:/data
     restart: unless-stopped

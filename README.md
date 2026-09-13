@@ -21,7 +21,13 @@ cd balance-sentinel
 docker compose up -d --build
 ```
 
-打开 http://localhost:3000 。首次使用点击“添加账号”。
+打开 http://localhost:3000 。默认管理员账号为 `admin` / `change-me-now`，首次启动前请务必通过环境变量修改：
+
+```bash
+ADMIN_USERNAME=your-admin ADMIN_PASSWORD=your-strong-password docker compose up -d --build
+```
+
+登录后点击“添加账号”。
 
 可通过环境变量调整监控频率（秒）：
 
