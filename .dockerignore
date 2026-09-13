@@ -2,3 +2,13 @@ node_modules
 .git
 .DS_Store
 npm-debug.log
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+data
+.venv
+venv
+__pycache__
+*.py[cod]

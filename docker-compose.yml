@@ -1,3 +1,5 @@
+name: balance-sentinel
+
 services:
   balance-monitor:
     build:
@@ -8,9 +10,13 @@ services:
     environment:
       DATABASE_PATH: /data/balance-monitor.db
       MONITOR_INTERVAL_SECONDS: ${MONITOR_INTERVAL_SECONDS:-300}
-      CORS_ORIGINS: ${CORS_ORIGINS:-*}
-      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-now}
+      # Optional first-run bootstrap. Leave empty to create the administrator in the setup page.
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # Comma-separated trusted origins. Empty keeps the deployment same-origin.
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      # Set true when TLS is terminated before the app and HTTPS is not visible to it.
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-}
     volumes:
       - balance_data:/data
     restart: unless-stopped

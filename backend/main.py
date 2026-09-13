@@ -1,28 +1,41 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 import os
 import sqlite3
 import uuid
 import secrets
+import base64
+import threading
+import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 
 DB_PATH = Path(os.getenv("DATABASE_PATH", "/data/balance-monitor.db"))
 POLL_SECONDS = max(30, int(os.getenv("MONITOR_INTERVAL_SECONDS", "300")))
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 SESSION_COOKIE = "balance_sentinel_session"
-SESSIONS: set[str] = set()
+SESSION_TTL_SECONDS = 86400
+COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "").lower() in {"1", "true", "yes"}
+PUBLIC_API_PATHS = {"/api/auth/status", "/api/auth/setup", "/api/auth/login", "/api/health"}
+_login_failures: dict[str, tuple[int, float]] = {}
+_login_limit_lock = threading.Lock()
+LOGIN_FAILURE_LIMIT = 5
+LOGIN_WINDOW_SECONDS = 300
+LOGIN_BUCKET_LIMIT = 4096
 
 
 def utc_now() -> str:
@@ -73,8 +86,117 @@ def init_db() -> None:
               FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_snapshots_account ON balance_snapshots(account_id, checked_at DESC);
+            CREATE TABLE IF NOT EXISTS administrators (
+              id INTEGER PRIMARY KEY CHECK(id = 1), username TEXT NOT NULL UNIQUE,
+              password_hash TEXT NOT NULL, created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+              token_hash TEXT PRIMARY KEY, username TEXT NOT NULL,
+              created_at TEXT NOT NULL, expires_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_admin_sessions_expiry ON admin_sessions(expires_at);
             """
         )
+
+
+def _password_hash(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
+    return "scrypt$16384$8$1$" + base64.urlsafe_b64encode(salt).decode() + "$" + base64.urlsafe_b64encode(digest).decode()
+
+
+def _password_verify(password: str, encoded: str) -> bool:
+    try:
+        scheme, n, r, p, salt_b64, digest_b64 = encoded.split("$", 5)
+        if scheme != "scrypt":
+            return False
+        salt = base64.urlsafe_b64decode(salt_b64.encode())
+        expected = base64.urlsafe_b64decode(digest_b64.encode())
+        actual = hashlib.scrypt(password.encode(), salt=salt, n=int(n), r=int(r), p=int(p))
+        return hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def _admin_row() -> sqlite3.Row | None:
+    with conn() as c:
+        try:
+            return c.execute("SELECT * FROM administrators WHERE id=1").fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                raise
+    init_db()
+    with conn() as c:
+        return c.execute("SELECT * FROM administrators WHERE id=1").fetchone()
+
+
+def bootstrap_admin() -> None:
+    username, password = os.getenv("ADMIN_USERNAME"), os.getenv("ADMIN_PASSWORD")
+    if _admin_row() or not username or not password:
+        return
+    username = username.strip()
+    if not 1 <= len(username) <= 64 or not 12 <= len(password) <= 256:
+        raise RuntimeError("ADMIN_USERNAME must be 1–64 characters and ADMIN_PASSWORD 12–256 characters")
+    with conn() as c:
+        c.execute("INSERT OR IGNORE INTO administrators(id,username,password_hash,created_at) VALUES(1,?,?,?)", (username, _password_hash(password), utc_now()))
+
+
+def _session_user(request: Request) -> str | None:
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token or len(token) > 256:
+        return None
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    now = utc_now()
+    with conn() as c:
+        try:
+            c.execute("DELETE FROM admin_sessions WHERE expires_at <= ?", (now,))
+            row = c.execute("SELECT username FROM admin_sessions WHERE token_hash=? AND expires_at > ?", (token_hash, now)).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                raise
+            init_db()
+            with conn() as retry:
+                row = retry.execute("SELECT username FROM admin_sessions WHERE token_hash=? AND expires_at > ?", (token_hash, now)).fetchone()
+    return row["username"] if row else None
+
+
+def _origin_allowed(request: Request) -> bool:
+    origin = request.headers.get("origin")
+    if not origin:
+        return request.headers.get("sec-fetch-site") != "cross-site"
+    trusted = [x.strip().rstrip("/") for x in os.getenv("CORS_ORIGINS", "").split(",") if x.strip() and x.strip() != "*"]
+    request_origin = f"{request.url.scheme}://{request.url.netloc}"
+    return origin.rstrip("/") == request_origin.rstrip("/") or origin.rstrip("/") in trusted
+
+
+def _login_attempt(request: Request) -> str:
+    # Do not trust caller-supplied X-Forwarded-For headers here.
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    with _login_limit_lock:
+        for key, (_, expires) in list(_login_failures.items()):
+            if expires <= now:
+                del _login_failures[key]
+        count, expiry = _login_failures.get(client_ip, (0, now + LOGIN_WINDOW_SECONDS))
+        if count >= LOGIN_FAILURE_LIMIT:
+            raise HTTPException(429, "尝试次数过多，请 5 分钟后再试", headers={"Retry-After": str(max(1, int(expiry - now)))})
+        if len(_login_failures) >= LOGIN_BUCKET_LIMIT and client_ip not in _login_failures:
+            # Fail closed while all rate-limit slots are occupied.
+            raise HTTPException(429, "登录请求过多，请稍后再试", headers={"Retry-After": str(LOGIN_WINDOW_SECONDS)})
+        _login_failures[client_ip] = (count + 1, expiry)
+    return client_ip
+
+
+def _new_session(username: str, request: Request, response: Response) -> None:
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    old_token = request.cookies.get(SESSION_COOKIE)
+    with conn() as c:
+        c.execute("DELETE FROM admin_sessions WHERE expires_at <= ?", (now.isoformat(),))
+        if old_token:
+            c.execute("DELETE FROM admin_sessions WHERE token_hash=?", (hashlib.sha256(old_token.encode()).hexdigest(),))
+        c.execute("INSERT INTO admin_sessions(token_hash,username,created_at,expires_at) VALUES(?,?,?,?)", (hashlib.sha256(token.encode()).hexdigest(), username, now.isoformat(), (now + timedelta(seconds=SESSION_TTL_SECONDS)).isoformat()))
+    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="strict", max_age=SESSION_TTL_SECONDS, secure=COOKIE_SECURE or request.url.scheme == "https", path="/")
 
 
 class AccountCreate(BaseModel):
@@ -223,6 +345,7 @@ async def monitor_loop() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    bootstrap_admin()
     task = asyncio.create_task(monitor_loop())
     yield
     task.cancel()
@@ -232,46 +355,93 @@ async def lifespan(_: FastAPI):
         pass
 
 
-app = FastAPI(title="Balance Monitor API", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",")], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="Balance Monitor API", version="1.0.0", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+_cors_origins = [x.strip().rstrip("/") for x in os.getenv("CORS_ORIGINS", "").split(",") if x.strip() and x.strip() != "*"]
+if _cors_origins:
+    app.add_middleware(CORSMiddleware, allow_origins=_cors_origins, allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Content-Type"])
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError):
+    if request.url.path.startswith("/api/auth/"):
+        # Pydantic's default error includes the rejected input, which can be a password.
+        return JSONResponse({"detail": "用户名须为 1–64 个字符；设置密码须为 12–256 个字符"}, status_code=422)
+    return await request_validation_exception_handler(request, exc)
 
 @app.middleware("http")
 async def admin_session_guard(request: Request, call_next):
-    if request.url.path.startswith("/api/accounts"):
-        token = request.cookies.get(SESSION_COOKIE)
-        if not token or token not in SESSIONS:
+    path = request.url.path
+    if path == "/api" or path.startswith("/api/"):
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and not _origin_allowed(request):
+            return JSONResponse({"detail": "不允许跨站请求"}, status_code=403)
+        request.state.admin_username = _session_user(request)
+        if path not in PUBLIC_API_PATHS and request.method != "OPTIONS" and not request.state.admin_username:
             return JSONResponse({"detail": "authentication required"}, status_code=401)
-    return await call_next(request)
+    response = await call_next(request)
+    if path == "/api" or path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 class LoginPayload(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def trim_username(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+class SetupPayload(LoginPayload):
+    password: str = Field(min_length=12, max_length=256)
+
+
+@app.get("/api/auth/status")
+def auth_status(request: Request):
+    username = request.state.admin_username
+    return {"setup_required": _admin_row() is None, "authenticated": bool(username), "username": username}
+
+
+@app.post("/api/auth/setup", status_code=201)
+def setup_admin(payload: SetupPayload, request: Request, response: Response):
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        if c.execute("SELECT 1 FROM administrators WHERE id=1").fetchone():
+            raise HTTPException(409, "管理员已设置，请登录")
+        c.execute("INSERT INTO administrators(id,username,password_hash,created_at) VALUES(1,?,?,?)", (payload.username, _password_hash(payload.password), utc_now()))
+    _new_session(payload.username, request, response)
+    return {"username": payload.username}
 
 
 @app.post("/api/auth/login")
-def login(payload: LoginPayload, response: Response):
-    if not secrets.compare_digest(payload.username, ADMIN_USERNAME) or not secrets.compare_digest(payload.password, ADMIN_PASSWORD):
+def login(payload: LoginPayload, request: Request, response: Response):
+    client_ip = _login_attempt(request)
+    admin = _admin_row()
+    if not admin:
+        raise HTTPException(409, "请先设置管理员账号")
+    password_matches = _password_verify(payload.password, admin["password_hash"])
+    if not hmac.compare_digest(payload.username.encode(), admin["username"].encode()) or not password_matches:
         raise HTTPException(401, "用户名或密码错误")
-    token = secrets.token_urlsafe(32)
-    SESSIONS.add(token)
-    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax", max_age=86400, secure=False)
-    return {"username": ADMIN_USERNAME}
+    with _login_limit_lock:
+        _login_failures.pop(client_ip, None)
+    _new_session(admin["username"], request, response)
+    return {"username": admin["username"]}
 
 
 @app.post("/api/auth/logout")
 def logout(request: Request, response: Response):
     token = request.cookies.get(SESSION_COOKIE)
-    if token: SESSIONS.discard(token)
-    response.delete_cookie(SESSION_COOKIE)
+    if token:
+        with conn() as c:
+            c.execute("DELETE FROM admin_sessions WHERE token_hash=?", (hashlib.sha256(token.encode()).hexdigest(),))
+    response.delete_cookie(SESSION_COOKIE, path="/", httponly=True, samesite="strict", secure=COOKIE_SECURE or request.url.scheme == "https")
     return {"ok": True}
 
 
 @app.get("/api/auth/me")
 def me(request: Request):
-    if request.cookies.get(SESSION_COOKIE) not in SESSIONS:
-        raise HTTPException(401, "authentication required")
-    return {"username": ADMIN_USERNAME}
+    return {"username": request.state.admin_username}
 
 
 @app.get("/api/health")
@@ -320,8 +490,8 @@ def update_account(account_id: str, payload: AccountUpdate) -> dict[str, Any]:
 @app.delete("/api/accounts/{account_id}", status_code=200)
 def delete_account(account_id: str) -> None:
     with conn() as c:
-        c.execute("DELETE FROM accounts WHERE id=?", (account_id,))
-        if c.rowcount == 0:
+        deleted = c.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+        if deleted.rowcount == 0:
             raise HTTPException(404, "account not found")
 
 
@@ -352,8 +522,17 @@ async def check_all() -> dict[str, Any]:
 
 @app.get("/{path:path}")
 def frontend(path: str):
+    # Keep SPA fallback while refusing requests that resemble filesystem traversal
+    # or internal source/data paths after URL normalization by the ASGI server.
+    segments = {part for part in path.split("/") if part}
+    if (path in {"docs", "redoc", "openapi.json"} or path == "api" or path.startswith("api/")
+            or "backend" in segments or "data" in segments or path.endswith((".py", ".db", ".sqlite"))):
+        raise HTTPException(404, "not found")
     public_dir = Path(__file__).resolve().parent / "public"
     if not public_dir.exists(): public_dir = Path(__file__).resolve().parent.parent / "public"
-    file = public_dir / path
+    public_dir = public_dir.resolve()
+    file = (public_dir / path).resolve()
+    if not file.is_relative_to(public_dir):
+        raise HTTPException(404, "not found")
     if path and file.is_file(): return FileResponse(file)
     return FileResponse(public_dir / "index.html")
