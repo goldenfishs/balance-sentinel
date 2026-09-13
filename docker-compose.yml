@@ -1,0 +1,15 @@
+services:
+  balance-monitor:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/balance-monitor.db
+      MONITOR_INTERVAL_SECONDS: ${MONITOR_INTERVAL_SECONDS:-300}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+    volumes:
+      - balance_data:/data
+    restart: unless-stopped
+
+volumes:
+  balance_data:
