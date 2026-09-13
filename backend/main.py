@@ -4,20 +4,25 @@ import asyncio
 import os
 import sqlite3
 import uuid
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, HttpUrl
 
 
 DB_PATH = Path(os.getenv("DATABASE_PATH", "/data/balance-monitor.db"))
 POLL_SECONDS = max(30, int(os.getenv("MONITOR_INTERVAL_SECONDS", "300")))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+SESSION_COOKIE = "balance_sentinel_session"
+SESSIONS: set[str] = set()
 
 
 def utc_now() -> str:
@@ -229,6 +234,44 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Balance Monitor API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",")], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+@app.middleware("http")
+async def admin_session_guard(request: Request, call_next):
+    if request.url.path.startswith("/api/accounts"):
+        token = request.cookies.get(SESSION_COOKIE)
+        if not token or token not in SESSIONS:
+            return JSONResponse({"detail": "authentication required"}, status_code=401)
+    return await call_next(request)
+
+
+class LoginPayload(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/auth/login")
+def login(payload: LoginPayload, response: Response):
+    if not secrets.compare_digest(payload.username, ADMIN_USERNAME) or not secrets.compare_digest(payload.password, ADMIN_PASSWORD):
+        raise HTTPException(401, "用户名或密码错误")
+    token = secrets.token_urlsafe(32)
+    SESSIONS.add(token)
+    response.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax", max_age=86400, secure=False)
+    return {"username": ADMIN_USERNAME}
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response):
+    token = request.cookies.get(SESSION_COOKIE)
+    if token: SESSIONS.discard(token)
+    response.delete_cookie(SESSION_COOKIE)
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def me(request: Request):
+    if request.cookies.get(SESSION_COOKIE) not in SESSIONS:
+        raise HTTPException(401, "authentication required")
+    return {"username": ADMIN_USERNAME}
 
 
 @app.get("/api/health")
