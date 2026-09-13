@@ -165,7 +165,11 @@ def _origin_allowed(request: Request) -> bool:
     if not origin:
         return request.headers.get("sec-fetch-site") != "cross-site"
     trusted = [x.strip().rstrip("/") for x in os.getenv("CORS_ORIGINS", "").split(",") if x.strip() and x.strip() != "*"]
-    request_origin = f"{request.url.scheme}://{request.url.netloc}"
+    # The app is normally behind Nginx. Uvicorn sees the internal Docker
+    # connection, so compare against the externally visible forwarded origin.
+    forwarded_proto = request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip()
+    forwarded_host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc)).split(",", 1)[0].strip()
+    request_origin = f"{forwarded_proto}://{forwarded_host}"
     return origin.rstrip("/") == request_origin.rstrip("/") or origin.rstrip("/") in trusted
 
 
