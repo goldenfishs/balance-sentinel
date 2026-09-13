@@ -1,8 +1,8 @@
 FROM python:3.12-slim
 WORKDIR /app
-COPY requirements.txt .
+COPY backend/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-COPY main.py .
+COPY backend/main.py ./main.py
 COPY public ./public
 ENV DATABASE_PATH=/data/balance-monitor.db
 RUN mkdir -p /data
