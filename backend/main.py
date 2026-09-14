@@ -36,6 +36,8 @@ _login_limit_lock = threading.Lock()
 LOGIN_FAILURE_LIMIT = 5
 LOGIN_WINDOW_SECONDS = 300
 LOGIN_BUCKET_LIMIT = 4096
+_channel_probe_lock = threading.Lock()
+_channel_probes_inflight: set[str] = set()
 
 
 def utc_now() -> str:
@@ -86,6 +88,42 @@ def init_db() -> None:
               FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_snapshots_account ON balance_snapshots(account_id, checked_at DESC);
+            CREATE TABLE IF NOT EXISTS test_channels (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              provider TEXT NOT NULL CHECK(provider IN ('sub2api','newapi')),
+              account_id TEXT,
+              base_url TEXT,
+              credential_kind TEXT NOT NULL DEFAULT 'api_key' CHECK(credential_kind IN ('api_key','account')),
+              api_key TEXT,
+              access_token TEXT,
+              user_id TEXT,
+              enabled INTEGER NOT NULL DEFAULT 1,
+              probe_enabled INTEGER NOT NULL DEFAULT 0,
+              probe_interval_seconds INTEGER NOT NULL DEFAULT 300,
+              models_json TEXT NOT NULL DEFAULT '[]',
+              last_models_at TEXT,
+              last_probe_at TEXT,
+              last_probe_status TEXT NOT NULL DEFAULT 'unknown',
+              last_probe_error TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_test_channels_schedule ON test_channels(probe_enabled, last_probe_at);
+            CREATE TABLE IF NOT EXISTS channel_probes (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              channel_id TEXT NOT NULL,
+              model TEXT,
+              checked_at TEXT NOT NULL,
+              status TEXT NOT NULL,
+              latency_ms REAL,
+              http_status INTEGER,
+              response TEXT,
+              error TEXT,
+              FOREIGN KEY(channel_id) REFERENCES test_channels(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_channel_probes_channel ON channel_probes(channel_id, checked_at DESC);
             CREATE TABLE IF NOT EXISTS administrators (
               id INTEGER PRIMARY KEY CHECK(id = 1), username TEXT NOT NULL UNIQUE,
               password_hash TEXT NOT NULL, created_at TEXT NOT NULL
@@ -228,6 +266,45 @@ class AccountUpdate(BaseModel):
     notes: str | None = Field(default=None, max_length=200)
 
 
+class ChannelCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    provider: Literal["sub2api", "newapi"]
+    account_id: str | None = None
+    base_url: HttpUrl | None = None
+    credential_kind: Literal["api_key", "account"] = "api_key"
+    api_key: str | None = None
+    access_token: str | None = None
+    user_id: str | None = None
+    enabled: bool = True
+    probe_enabled: bool = False
+    probe_interval_seconds: int = Field(default=300, ge=30, le=86400)
+    models: list[str] = Field(default_factory=list, max_length=200)
+
+
+class ChannelUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    account_id: str | None = None
+    base_url: HttpUrl | None = None
+    credential_kind: Literal["api_key", "account"] | None = None
+    api_key: str | None = None
+    access_token: str | None = None
+    user_id: str | None = None
+    enabled: bool | None = None
+    probe_enabled: bool | None = None
+    probe_interval_seconds: int | None = Field(default=None, ge=30, le=86400)
+    models: list[str] | None = Field(default=None, max_length=200)
+
+
+class ProbeRequest(BaseModel):
+    model: str | None = Field(default=None, max_length=200)
+    prompt: str = Field(default="ping", min_length=1, max_length=200)
+
+
+class ScheduleUpdate(BaseModel):
+    enabled: bool
+    interval_seconds: int = Field(default=300, ge=30, le=86400)
+
+
 def mask(value: str | None) -> str | None:
     if not value:
         return None
@@ -334,6 +411,146 @@ async def check_account(account_id: str) -> dict[str, Any]:
     return result
 
 
+def channel_view(row: sqlite3.Row) -> dict[str, Any]:
+    result = dict(row)
+    try:
+        result["models"] = json.loads(result.pop("models_json") or "[]")
+    except (TypeError, ValueError):
+        result["models"] = []
+        result.pop("models_json", None)
+    result["enabled"] = bool(result.get("enabled"))
+    result["probe_enabled"] = bool(result.get("probe_enabled"))
+    result.pop("api_key", None)
+    result.pop("access_token", None)
+    result["credential"] = "已关联账号" if result.get("account_id") else "已配置" if result.get("credential_kind") else None
+    return result
+
+
+def _channel_row(channel_id: str) -> sqlite3.Row:
+    with conn() as c:
+        row = c.execute("SELECT * FROM test_channels WHERE id=?", (channel_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "channel not found")
+    return row
+
+
+def _channel_connection(row: sqlite3.Row) -> tuple[str, dict[str, str]]:
+    """Resolve a channel's URL and credentials, preferring a linked account."""
+    source = row
+    if row["account_id"]:
+        with conn() as c:
+            account = c.execute("SELECT * FROM accounts WHERE id=?", (row["account_id"],)).fetchone()
+        if not account:
+            raise ValueError("linked account not found")
+        source = account
+    base = source["base_url"] or row["base_url"]
+    if not base:
+        raise ValueError("base_url is required")
+    headers: dict[str, str] = {"Accept": "application/json"}
+    if source["credential_kind"] == "account" and source["access_token"]:
+        headers["Authorization"] = f"Bearer {source['access_token']}"
+        if source["user_id"]:
+            headers["New-Api-User"] = source["user_id"]
+    elif source["api_key"]:
+        headers["Authorization"] = f"Bearer {source['api_key']}"
+    else:
+        raise ValueError("missing credential")
+    return normalize_url(str(base)), headers
+
+
+def _models_from_payload(raw: Any) -> list[str]:
+    values = raw.get("data", raw) if isinstance(raw, dict) else raw
+    if isinstance(values, dict):
+        values = values.get("models", values.get("items", []))
+    if not isinstance(values, list):
+        return []
+    models: list[str] = []
+    for item in values:
+        value = item.get("id") if isinstance(item, dict) else item
+        if isinstance(value, str) and value and value not in models:
+            models.append(value[:200])
+    return models[:200]
+
+
+async def fetch_channel_models(row: sqlite3.Row) -> list[str]:
+    base, headers = _channel_connection(row)
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        response = await client.get(f"{base}/v1/models", headers=headers)
+        response.raise_for_status()
+        models = _models_from_payload(response.json())
+    checked_at = utc_now()
+    with conn() as c:
+        c.execute("UPDATE test_channels SET models_json=?,last_models_at=?,updated_at=? WHERE id=?", (json.dumps(models, ensure_ascii=False), checked_at, checked_at, row["id"]))
+    return models
+
+
+async def probe_channel(channel_id: str, model: str | None = None, prompt: str = "ping") -> dict[str, Any]:
+    row = _channel_row(channel_id)
+    base, headers = _channel_connection(row)
+    try:
+        known = json.loads(row["models_json"] or "[]")
+    except (TypeError, ValueError):
+        known = []
+    if not model:
+        if not known:
+            known = await fetch_channel_models(row)
+        model = known[0] if known else None
+    if not model:
+        raise HTTPException(400, "请先获取模型列表，或指定模型名称")
+    payload = {"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 1, "stream": False}
+    started = time.perf_counter()
+    status, response_text, error = None, None, None
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            response = await client.post(f"{base}/v1/chat/completions", headers={**headers, "Content-Type": "application/json"}, json=payload)
+            status = response.status_code
+            response_text = response.text[:1000]
+            response.raise_for_status()
+        probe_status = "ok"
+    except Exception as exc:
+        probe_status = "error"
+        error = str(exc)[:500]
+    latency = round((time.perf_counter() - started) * 1000, 1)
+    checked_at = utc_now()
+    with conn() as c:
+        c.execute("UPDATE test_channels SET last_probe_at=?,last_probe_status=?,last_probe_error=?,updated_at=? WHERE id=?", (checked_at, probe_status, error, checked_at, channel_id))
+        c.execute("INSERT INTO channel_probes(channel_id,model,checked_at,status,latency_ms,http_status,response,error) VALUES(?,?,?,?,?,?,?,?)", (channel_id, model, checked_at, probe_status, latency, status, response_text, error))
+    return {"channel_id": channel_id, "model": model, "status": probe_status, "latency_ms": latency, "http_status": status, "response": response_text, "error": error, "checked_at": checked_at}
+
+
+async def channel_monitor_loop() -> None:
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            with conn() as c:
+                rows = c.execute("SELECT * FROM test_channels WHERE enabled=1 AND probe_enabled=1").fetchall()
+            due: list[str] = []
+            for row in rows:
+                if not row["last_probe_at"]:
+                    due.append(row["id"])
+                    continue
+                try:
+                    last = datetime.fromisoformat(row["last_probe_at"])
+                    if (now - last).total_seconds() >= row["probe_interval_seconds"]:
+                        due.append(row["id"])
+                except ValueError:
+                    due.append(row["id"])
+            if due:
+                with _channel_probe_lock:
+                    due = [channel_id for channel_id in due if channel_id not in _channel_probes_inflight]
+                    _channel_probes_inflight.update(due)
+                async def scheduled_probe(channel_id: str):
+                    try:
+                        return await probe_channel(channel_id)
+                    finally:
+                        with _channel_probe_lock:
+                            _channel_probes_inflight.discard(channel_id)
+                await asyncio.gather(*(scheduled_probe(channel_id) for channel_id in due), return_exceptions=True)
+        except Exception:
+            pass
+        await asyncio.sleep(10)
+
+
 async def monitor_loop() -> None:
     while True:
         try:
@@ -351,10 +568,16 @@ async def lifespan(_: FastAPI):
     init_db()
     bootstrap_admin()
     task = asyncio.create_task(monitor_loop())
+    channel_task = asyncio.create_task(channel_monitor_loop())
     yield
     task.cancel()
+    channel_task.cancel()
     try:
         await task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await channel_task
     except asyncio.CancelledError:
         pass
 
@@ -362,7 +585,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Balance Monitor API", version="1.0.0", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 _cors_origins = [x.strip().rstrip("/") for x in os.getenv("CORS_ORIGINS", "").split(",") if x.strip() and x.strip() != "*"]
 if _cors_origins:
-    app.add_middleware(CORSMiddleware, allow_origins=_cors_origins, allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Content-Type"])
+    app.add_middleware(CORSMiddleware, allow_origins=_cors_origins, allow_credentials=True, allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"], allow_headers=["Content-Type"])
 
 
 @app.exception_handler(RequestValidationError)
@@ -451,6 +674,147 @@ def me(request: Request):
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "time": utc_now()}
+
+
+@app.get("/api/channels")
+def list_channels() -> list[dict[str, Any]]:
+    with conn() as c:
+        return [channel_view(r) for r in c.execute("SELECT * FROM test_channels ORDER BY created_at DESC")]
+
+
+@app.post("/api/channels", status_code=201)
+def create_channel(payload: ChannelCreate) -> dict[str, Any]:
+    account = None
+    if payload.account_id:
+        with conn() as c:
+            account = c.execute("SELECT * FROM accounts WHERE id=?", (payload.account_id,)).fetchone()
+        if not account:
+            raise HTTPException(404, "linked account not found")
+        if account["provider"] != payload.provider:
+            raise HTTPException(400, "channel provider does not match linked account")
+    elif not payload.base_url:
+        raise HTTPException(400, "base_url is required when no account is linked")
+    if not account and payload.credential_kind == "account" and not payload.access_token:
+        raise HTTPException(400, "access_token is required for account mode")
+    if not account and payload.credential_kind == "api_key" and not payload.api_key:
+        raise HTTPException(400, "api_key is required")
+    now, channel_id = utc_now(), str(uuid.uuid4())
+    with conn() as c:
+        c.execute("INSERT INTO test_channels(id,name,provider,account_id,base_url,credential_kind,api_key,access_token,user_id,enabled,probe_enabled,probe_interval_seconds,models_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (channel_id, payload.name, payload.provider, payload.account_id, None if account else str(payload.base_url).rstrip("/"), account["credential_kind"] if account else payload.credential_kind, None if account else payload.api_key, None if account else payload.access_token, None if account else payload.user_id, int(payload.enabled), int(payload.probe_enabled), payload.probe_interval_seconds, json.dumps(payload.models[:200], ensure_ascii=False), now, now))
+        row = c.execute("SELECT * FROM test_channels WHERE id=?", (channel_id,)).fetchone()
+    return channel_view(row)
+
+
+@app.patch("/api/channels/{channel_id}")
+def update_channel(channel_id: str, payload: ChannelUpdate) -> dict[str, Any]:
+    values = payload.model_dump(exclude_unset=True)
+    if "base_url" in values and values["base_url"]:
+        values["base_url"] = str(values["base_url"]).rstrip("/")
+    if "models" in values:
+        values["models_json"] = json.dumps(values.pop("models")[:200], ensure_ascii=False)
+    for key in ("enabled", "probe_enabled"):
+        if key in values:
+            values[key] = int(values[key])
+    with conn() as c:
+        current = c.execute("SELECT * FROM test_channels WHERE id=?", (channel_id,)).fetchone()
+        if not current:
+            raise HTTPException(404, "channel not found")
+        if values.get("account_id"):
+            account = c.execute("SELECT * FROM accounts WHERE id=?", (values["account_id"],)).fetchone()
+            if not account:
+                raise HTTPException(404, "linked account not found")
+            if account["provider"] != (values.get("provider") or current["provider"]):
+                raise HTTPException(400, "channel provider does not match linked account")
+            # Linked channels never duplicate account credentials.
+            values.update({"api_key": None, "access_token": None, "user_id": None, "base_url": None})
+        elif values.get("credential_kind") == "account" and not values.get("access_token", current["access_token"]):
+            raise HTTPException(400, "access_token is required for account mode")
+        elif values.get("credential_kind") == "api_key" and not values.get("api_key", current["api_key"]):
+            raise HTTPException(400, "api_key is required")
+        if not values:
+            return channel_view(current)
+        values["updated_at"] = utc_now()
+        allowed = {"name", "account_id", "base_url", "credential_kind", "api_key", "access_token", "user_id", "enabled", "probe_enabled", "probe_interval_seconds", "models_json", "updated_at"}
+        values = {k: v for k, v in values.items() if k in allowed}
+        clause = ",".join(f"{k}=?" for k in values)
+        c.execute(f"UPDATE test_channels SET {clause} WHERE id=?", (*values.values(), channel_id))
+        row = c.execute("SELECT * FROM test_channels WHERE id=?", (channel_id,)).fetchone()
+    return channel_view(row)
+
+
+@app.delete("/api/channels/{channel_id}")
+def delete_channel(channel_id: str) -> dict[str, bool]:
+    with conn() as c:
+        deleted = c.execute("DELETE FROM test_channels WHERE id=?", (channel_id,))
+        if deleted.rowcount == 0:
+            raise HTTPException(404, "channel not found")
+    return {"ok": True}
+
+
+@app.post("/api/channels/{channel_id}/models")
+@app.post("/api/channels/{channel_id}/models/refresh")
+async def refresh_channel_models(channel_id: str) -> dict[str, Any]:
+    row = _channel_row(channel_id)
+    try:
+        models = await fetch_channel_models(row)
+        return {"channel_id": channel_id, "models": models, "fetched_at": utc_now()}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"获取模型列表失败: {str(exc)[:300]}")
+
+
+@app.post("/api/channels/{channel_id}/probe")
+async def probe(channel_id: str, payload: ProbeRequest | None = None) -> dict[str, Any]:
+    payload = payload or ProbeRequest()
+    try:
+        return await probe_channel(channel_id, payload.model, payload.prompt)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"模型探活失败: {str(exc)[:300]}")
+
+
+@app.post("/api/channels/probe-all")
+async def probe_all_channels() -> dict[str, Any]:
+    with conn() as c:
+        ids = [r["id"] for r in c.execute("SELECT id FROM test_channels WHERE enabled=1")]
+    results = await asyncio.gather(*(probe_all_channel(channel_id) for channel_id in ids), return_exceptions=True)
+    return {"checked": len(ids), "results": [r if isinstance(r, dict) else {"status": "error", "error": str(r)} for r in results]}
+
+
+@app.post("/api/channels/{channel_id}/probe-all")
+async def probe_all_channel(channel_id: str) -> dict[str, Any]:
+    row = _channel_row(channel_id)
+    try:
+        models = json.loads(row["models_json"] or "[]")
+    except (TypeError, ValueError):
+        models = []
+    if not models:
+        models = await fetch_channel_models(row)
+    results = await asyncio.gather(*(probe_channel(channel_id, model) for model in models), return_exceptions=True)
+    return {"channel_id": channel_id, "checked": len(models), "results": [r if isinstance(r, dict) else {"status": "error", "error": str(r)} for r in results]}
+
+
+@app.put("/api/channels/{channel_id}/schedule")
+def update_channel_schedule(channel_id: str, payload: ScheduleUpdate) -> dict[str, Any]:
+    with conn() as c:
+        if not c.execute("SELECT 1 FROM test_channels WHERE id=?", (channel_id,)).fetchone():
+            raise HTTPException(404, "channel not found")
+        now = utc_now()
+        c.execute("UPDATE test_channels SET probe_enabled=?,probe_interval_seconds=?,updated_at=? WHERE id=?", (int(payload.enabled), payload.interval_seconds, now, channel_id))
+        row = c.execute("SELECT * FROM test_channels WHERE id=?", (channel_id,)).fetchone()
+    return channel_view(row)
+
+
+@app.get("/api/channels/{channel_id}/probes")
+def channel_probe_history(channel_id: str, limit: int = 30) -> list[dict[str, Any]]:
+    limit = min(max(limit, 1), 200)
+    with conn() as c:
+        if not c.execute("SELECT 1 FROM test_channels WHERE id=?", (channel_id,)).fetchone():
+            raise HTTPException(404, "channel not found")
+        rows = c.execute("SELECT id,model,checked_at,status,latency_ms,http_status,response,error FROM channel_probes WHERE channel_id=? ORDER BY checked_at DESC LIMIT ?", (channel_id, limit)).fetchall()
+    return [dict(row) for row in rows]
 
 
 @app.get("/api/accounts")
